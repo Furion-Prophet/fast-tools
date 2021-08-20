@@ -1,0 +1,286 @@
+#!/usr/bin/env node
+/* eslint-disable no-restricted-globals */
+/**
+ * 调用tinify api进行图片压缩，在调用之前会对图片进行处理，有两个依据：
+ * 1. 根据上次压缩的时间，进行文件修改时间的判断，如果修改之间比 .last_tinified 的新，会认为是压缩过的，除非：
+ * 2. 如果发现文件有打TAG的痕迹，搜索出现 tinified 字样
+ * 经过以上两个判断，结果为true，再继续进行压缩，毕竟压缩会占用免费额度和网络请求时间
+ * 命令行用法：node tinify.js -k 0 sample
+ * -k 指定tinify api key, 可用数字索引，使用 ApiKeys 的配置，或者直接原文key
+ * -t 仅仅打个tag，适用于已知进行过压缩的图片
+ * -r 递归查找目录下的图片，默认只查找当前目录
+ * sample 是指定图片目录，不填则默认是 src/images 目录，递归访问； 如果带路径分隔符，则直接使用该完整路径 比如 other/images
+ */
+ const fs = require('fs');
+ const path = require('path');
+ const tinify = require('tinify');
+ const child_process = require('child_process');
+ 
+ const MaxCount = 500;
+ 
+ const ApiKeys = [
+   'x4t5QCN2QCMZ9vMZPsQYW2hbk4Hn3djG',
+ ];
+ const ImageExifTool = 'Image-ExifTool-11.51';
+ const SetupPath = path.join(require('os').homedir(), '.npm/tinify');
+ 
+ const TinifyConfig = { keyIndex: 0, mtime: 0 };
+ const touch = filename => fs.closeSync(fs.openSync(filename, 'a+'));
+ const fLastTinified = `${__dirname}/.last_tinified`;
+ let defaultApiKey = 0;
+ let lastTinifiedTime = 0;
+ 
+ function initTinifyConfig(forceUpdate) {
+   try {
+     const lastConfig = JSON.parse(fs.readFileSync(fLastTinified));
+     TinifyConfig.keyIndex = lastConfig.keyIndex || 0;
+     lastTinifiedTime = forceUpdate
+       ? 0
+       : lastConfig.mtime || fs.statSync(fLastTinified).mtimeMs;
+     defaultApiKey = TinifyConfig.keyIndex % ApiKeys.length;
+     TinifyConfig.mtime = lastTinifiedTime;
+   } catch (e) {
+     lastTinifiedTime = 0;
+   }
+ }
+ 
+ function hasTinified(picPath) {
+   const { mtimeMs, ctimeMs } = fs.statSync(picPath);
+   const checkByTime = Math.max(mtimeMs, ctimeMs) < lastTinifiedTime;
+   let checkByMeta;
+   if (!checkByTime) checkByMeta = readTag(picPath);
+   return checkByTime || checkByMeta;
+ }
+ 
+ function doTinified(filepath, tagOnly) {
+   if (tagOnly) return Promise.resolve({ value: true, filepath });
+
+   return new Promise(resolve => {
+     tinify.fromFile(filepath).toFile(filepath, err => {
+       if (!err) resolve({ value: true, filepath });
+       else resolve({ value: false, filepath, err });
+     });
+   });
+ }
+ 
+ function checkBalance() {
+   return tinify
+     .validate()
+     .then(() => {
+       const rest = MaxCount - tinify.compressionCount;
+       console.log(`该API KEY本月剩余压缩次数：${rest}`);
+       return rest;
+     })
+     .catch(e => console.error(`validate error: ${e.message}`));
+ }
+ 
+ const tinifyQueue = [];
+ function checkDir(dir, recursive) {
+   fs.readdirSync(dir).forEach(filename => {
+     const filepath = path.resolve(path.join(dir, filename));
+     const stat = fs.lstatSync(filepath);
+     if (recursive && stat.isDirectory()) {
+       checkDir(filepath, recursive);
+       return;
+     }
+     const supported = ['.png', '.jpg', '.jpeg'].some(suffix => filename.indexOf(suffix) > -1)
+     if (!supported) return
+     if (!hasTinified(filepath)) tinifyQueue.push(filepath);
+   });
+ }
+ 
+ function initArgs() {
+   const options = process.argv
+     .slice()
+     .reverse()
+     .slice(0, -2);
+   let key = ApiKeys[defaultApiKey];
+   // node tinify.js -k 0 sample
+   const kPos = options.indexOf('-k');
+   if (kPos > -1) {
+     key = options[kPos - 1];
+     key = isNaN(Number(key)) ? key : ApiKeys[key];
+     options.splice(kPos - 1, 2);
+   }
+   let recursive = options.indexOf('-r');
+   let tagOnly = options.indexOf('-t');
+   // const forceUpdate = options.indexOf('-f') > -1;
+   const forceUpdate = true;
+   if (recursive > -1) options.splice(recursive, 1);
+   recursive = recursive > -1;
+   if (tagOnly > -1) options.splice(tagOnly, 1);
+   tagOnly = tagOnly > -1;
+ 
+   const filenames = [];
+   const dirs = [];
+   options.forEach(option => {
+     const isFile =
+     option.indexOf('.png') !== -1 || option.indexOf('.jpg') !== -1;
+     if (isFile) {
+       filenames.push(path.resolve(option));
+     } else {
+       // 绝对路径
+       if (option.match(/^[\/-]/)) {
+         dirs.push(option);
+         return;
+       }
+       let subDir = option;
+       // 仅传入目录名，则假设是src/images目录结构
+       let imageDir = `src/images/${subDir}`;
+       if (!fs.existsSync(imageDir)) imageDir = subDir;
+       dirs.push(imageDir);
+     }
+   });
+ 
+   console.log('待处理文件', filenames);
+   console.log('待处理目录', dirs);
+ 
+   return { dirs, filenames, key, recursive, tagOnly, forceUpdate };
+ }
+ 
+ const KeywordTag = 'tinified';
+ 
+ function writeTag(filepath) {
+   const oldBuf = fs.readFileSync(filepath);
+   const tagged = readTag(filepath, oldBuf);
+   if (tagged) return;
+ 
+   const exiftool = path.join(SetupPath, ImageExifTool, 'exiftool');
+   try {
+     console.log('writing tag', filepath);
+     const result = child_process.execSync(
+       `${exiftool} -m -overwrite_original -Copyright=${KeywordTag} ${filepath}`
+     );
+     // console.log(result.toString());
+   } catch (e) {
+     console.error(e);
+   }
+ }
+ function readTag(filepath, buf) {
+   const hasTag =
+     (buf || fs.readFileSync(filepath)).lastIndexOf(KeywordTag) > -1;
+ 
+   return hasTag;
+ }
+ 
+ console.log('开始进行压缩检测...');
+ (async function() {
+   await setupExiftool();
+   doWork();
+ })();
+ 
+ function doWork() {
+   const args = initArgs();
+   console.log('初始参数', args);
+   tinify.key = args.key;
+   tinify.proxy = process.env.https_proxy || process.env.all_proxy;
+ 
+   initTinifyConfig(args.forceUpdate);
+ 
+   args.filenames.filter(filename => {
+     if (!hasTinified(filename)) tinifyQueue.push(filename);
+   });
+   args.dirs.forEach(imageDir => checkDir(imageDir, args.recursive));
+   console.log(tinifyQueue);
+   console.log('压缩检测结束...');
+ 
+   console.log('开始压缩操作...');
+   const hasVisited = {};
+   Promise.all(
+     tinifyQueue.map(filepath => {
+       if (hasVisited[filepath])
+         return { value: false, filepath, err: '重复文件' };
+       hasVisited[filepath] = true;
+       return doTinified(filepath, args.tagOnly);
+     })
+   )
+     .then(res => {
+       res.forEach(({ value, filepath, err }) => {
+         if (!value) {
+           console.log('tinify failed: ', filepath, err);
+         } else {
+           writeTag(filepath);
+         }
+       });
+       console.log('结束压缩操作...');
+       // 每次都更新，该文件的修改时间用来判断是否压缩过
+       touch(fLastTinified);
+     })
+     .then(() => {
+       console.log('检查tinify API剩余额度');
+       return checkBalance();
+     })
+     .then(rest => {
+       // api key 不够用的时候自动轮转
+       if (rest === 0) TinifyConfig.keyIndex += 1;
+       TinifyConfig.mtime = +new Date();
+       fs.writeFileSync(fLastTinified, JSON.stringify(TinifyConfig));
+     });
+ }
+ 
+ function setupExiftool() {
+   return new Promise(function(resolve, reject) {
+     console.log('exiftool安装检测');
+     const exiftool = path.join(SetupPath, ImageExifTool, 'exiftool');
+     try {
+       console.log('检测安装路径', exiftool);
+       fs.statSync(exiftool);
+       console.log('exiftool已安装');
+       resolve();
+     } catch (e) {
+       const singleLine = require('single-line-log').stdout;
+       const url =
+       (process.env.TinifyExifToolUrl || 'https://exiftool.org/') +
+       ImageExifTool +
+       '.tar.gz';
+       const http = url.startsWith('http:') ? require('http') : require('https');
+       const filepath = path.join(SetupPath, url.match(/([^\/]*?.gz)/)[0]);
+ 
+       function doSetup() {
+         child_process.execSync(`tar -xf ${filepath} -C ${SetupPath}`, {
+           stdio: 'inherit',
+         });
+       }
+       if (fs.existsSync(filepath)) {
+         console.log('exiftool已下载安装，开始安装...');
+         doSetup();
+         console.log('exiftool安装完成');
+         resolve();
+         return;
+       }
+       child_process.execSync(`mkdir -p ${SetupPath}`);
+ 
+       const file = fs.createWriteStream(filepath);
+ 
+       console.log('exiftool未安装，开始下载...');
+       console.log('正在下载', url);
+       let totalLength = 0;
+       let downloaded = 0;
+       http
+         .get(url, function(response) {
+           response.pipe(file).on('finish', function() {
+             doSetup();
+             singleLine.clear();
+             console.log('exiftool安装完成');
+             resolve();
+           });
+ 
+           response.on('data', function(chunk) {
+             downloaded += chunk.length;
+             singleLine(((downloaded / totalLength) * 100).toFixed(2) + '%\n');
+           });
+         })
+         .on('response', function(data) {
+           totalLength = data.headers['content-length'];
+           console.log(
+             '文件总大小：' + Math.round(totalLength / 1024 / 1024) + 'MB'
+           );
+         })
+         .on('error', function(e) {
+           console.error('exiftool安装失败', e);
+           reject();
+         });
+     }
+   });
+ }
+ 

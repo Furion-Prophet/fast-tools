@@ -1,0 +1,19 @@
+{
+  "name": "fast-tools",
+  "version": "1.0.0",
+  "description": "前端工程化的一些node脚本",
+  "main": "index.js",
+  "bin": {
+    "minimg": "./tools/tinyfy"
+  },
+  "keywords": [
+    "node-tools"
+  ],
+  "author": "Shendelzare-Silkwood",
+  "license": "ISC",
+  "dependencies": {
+    "commander": "^8.1.0",
+    "minimist": "^1.2.5",
+    "tinify": "^1.6.0-beta.2"
+  }
+}
